@@ -5,12 +5,12 @@ Uso:
 """
 
 import os
-import sys
 import time
 import argparse
 from collections import deque
 
 from context_model import ContextModel, NUM_CONTEXTS_1D
+
 
 # ---------------------------------------------------------------------------
 # rANS primitivos
@@ -54,7 +54,7 @@ def load_symbols(path):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline completo para um arquivo
+# Pipeline completo para um arquivo (contexto 1D lookahead)
 # ---------------------------------------------------------------------------
 
 def run_one(path, recalc_window):
@@ -64,63 +64,65 @@ def run_one(path, recalc_window):
     rw = recalc_window
     n_blocks = (n + rw - 1) // rw
 
-    # Função de contexto 1D (lookahead)
     def get_ctx(i):
+        """Contexto 1D lookahead: ctx do símbolo i = symbols[i+1]."""
         return symbols[i + 1] if i + 1 < n else 0
 
-    # Pré-varredura por bloco
-    model_enc = ContextModel(mode="static", num_contexts=n_ctx,
-                             recalc_window=rw)
+    # Pré-varredura por bloco (contexto 1D)
+    model_enc = ContextModel(mode="static", num_contexts=n_ctx, recalc_window=rw)
     block_freqs = []
     for b in range(n_blocks):
         counts = [[1, 1] for _ in range(n_ctx)]
         start = b * rw
-        end = min(start + rw, n)
+        end   = min(start + rw, n)
         for i in range(start, end):
             ctx = get_ctx(i)
             counts[ctx][symbols[i]] += 1
         block_freqs.append(model_enc._normalize(counts))
     model_enc.set_block_freqs(block_freqs)
 
-    # Encode
-    ctx0 = get_ctx(0)
+    # -----------------------------------------------------------------------
+    # ENCODE (ordem direta 0 → n-1)
+    # -----------------------------------------------------------------------
+    ctx0    = get_ctx(0)
     counts0 = model_enc.get_counts(ctx0, 0)
-    state = counts0[0] + counts0[1]
+    state   = counts0[0] + counts0[1]
     bitstream = []
 
     t0 = time.time()
     for i in range(n):
         ctx = get_ctx(i)
         blk = i // rw if rw > 0 else None
-        c = model_enc.get_counts(ctx, blk)
+        c   = model_enc.get_counts(ctx, blk)
         state = _encode_symbol(state, symbols[i], c, bitstream)
     t_enc = time.time() - t0
 
     bitstream_str = "".join(map(str, bitstream))
-    final_state = state
-    hdr_hex = model_enc.serialize_static_headers()
+    final_state   = state
+    hdr_hex       = model_enc.serialize_static_headers()
 
-    # Decode
-    model_dec = ContextModel(mode="static", num_contexts=n_ctx,
-                             recalc_window=rw)
+    # -----------------------------------------------------------------------
+    # DECODE (ordem inversa n-1 → 0, contexto 1D: last_decoded)
+    # -----------------------------------------------------------------------
+    model_dec = ContextModel(mode="static", num_contexts=n_ctx, recalc_window=rw)
     model_dec.load_static_headers(hdr_hex)
 
-    bits_q = deque(map(int, bitstream_str[::-1]))
-    decoded = [0] * n
-    state = final_state
+    bits_q       = deque(map(int, bitstream_str[::-1]))
+    decoded      = [0] * n
+    state        = final_state
     last_decoded = 0
 
     t0 = time.time()
     for i in range(n - 1, -1, -1):
         ctx = last_decoded
         blk = i // rw if rw > 0 else None
-        c = model_dec.get_counts(ctx, blk)
+        c   = model_dec.get_counts(ctx, blk)
         s, prev = _D_rANS(state, c)
         M = c[0] + c[1]
         while prev < M and bits_q:
             prev = (prev << 1) | bits_q.popleft()
-        state = prev
-        decoded[i] = s
+        state        = prev
+        decoded[i]   = s
         last_decoded = s
     t_dec = time.time() - t0
 
@@ -161,18 +163,41 @@ def main():
     args = parser.parse_args()
     rw = args.recalc_window
 
-    print("=" * 100)
-    print(f"  RUN ALL  |  recalc_window = {rw}")
-    print("=" * 100)
-
-    # --- INPUTS 1D ---
     W = 130
+    print("=" * W)
+    print(f"  RUN ALL  |  contexto=1D lookahead  |  recalc_window = {rw}")
+    print("=" * W)
+
+    header_row = (
+        f"{'BLOCO':>8} | {'ARQUIVO':<12} | {'ORIGINAL':>10} | {'BLOCOS':>6} | "
+        f"{'OVERHEAD':>10} | {'PADDING':>8} | {'ESTADO':>8} | {'BITSTREAM':>10} | "
+        f"{'COMPRIMIDO':>11} | {'TAXA':>8} | {'T_ENC':>8} | {'T_DEC':>8} | OK"
+    )
+
+    def print_row(label, r):
+        ok = "✓" if r["decode_ok"] else "✗"
+        print(
+            f"{rw:>8} | {label:<12} | {r['n']:>10} | {r['n_blocks']:>6} | "
+            f"{r['bits_hdr']:>10} | {r['bits_pad']:>8} | {r['bits_state']:>8} | "
+            f"{r['bits_bs']:>10} | {r['bits_total']:>11} | "
+            f"{r['taxa']:>7.2f}% | {r['t_enc']:>7.4f}s | {r['t_dec']:>7.4f}s | {ok}"
+        )
+
+    def print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total):
+        if g_n > 0:
+            g_taxa = (1.0 - g_total / g_n) * 100
+            print("-" * W)
+            print(
+                f"{'':>8} | {'GLOBAL':<12} | {g_n:>10} | {'':>6} | "
+                f"{g_hdr:>10} | {g_pad:>8} | {g_state:>8} | {g_bs:>10} | "
+                f"{g_total:>11} | {g_taxa:>7.2f}% | {'':>8} | {'':>8} |"
+            )
+
+    # --- INPUTS ---
     print(f"\n{'─' * W}")
-    print(f"  RESULTADO DOS TESTES — INPUTS (contexto 1D, recalc_window={rw})")
+    print(f"  INPUTS (contexto 1D lookahead, recalc_window={rw})")
     print(f"{'─' * W}")
-    print(f"{'BLOCO':>8} | {'ARQUIVO':<12} | {'ORIGINAL':>10} | {'BLOCOS':>6} | "
-          f"{'OVERHEAD':>10} | {'PADDING':>8} | {'ESTADO':>8} | {'BITSTREAM':>10} | {'COMPRIMIDO':>11} | "
-          f"{'TAXA':>8} | {'T_ENC':>8} | {'T_DEC':>8} | {'OK'}")
+    print(header_row)
     print("-" * W)
 
     input_dir = "inputs"
@@ -183,27 +208,16 @@ def main():
             print(f"  input_{i}.txt não encontrado, pulando.")
             continue
         r = run_one(path, rw)
-        ok = "✓" if r["decode_ok"] else "✗"
-        print(f"{rw:>8} | {'INPUT_'+str(i):<12} | {r['n']:>10} | {r['n_blocks']:>6} | "
-              f"{r['bits_hdr']:>10} | {r['bits_pad']:>8} | {r['bits_state']:>8} | {r['bits_bs']:>10} | {r['bits_total']:>11} | "
-              f"{r['taxa']:>7.2f}% | {r['t_enc']:>7.4f}s | {r['t_dec']:>7.4f}s | {ok}")
-        g_n += r['n']; g_bs += r['bits_bs']; g_state += r['bits_state']
-        g_hdr += r['bits_hdr']; g_pad += r['bits_pad']; g_total += r['bits_total']
-    # Resumo global
-    if g_n > 0:
-        g_taxa = (1.0 - g_total / g_n) * 100
-        print("-" * W)
-        print(f"{'':>8} | {'GLOBAL':<12} | {g_n:>10} | {'':>6} | "
-              f"{g_hdr:>10} | {g_pad:>8} | {g_state:>8} | {g_bs:>10} | {g_total:>11} | "
-              f"{g_taxa:>7.2f}% | {'':>8} | {'':>8} |")
+        print_row("INPUT_" + str(i), r)
+        g_n += r["n"]; g_bs += r["bits_bs"]; g_state += r["bits_state"]
+        g_hdr += r["bits_hdr"]; g_pad += r["bits_pad"]; g_total += r["bits_total"]
+    print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total)
 
-    # --- PLANOS DE BITS (contexto 1D) ---
+    # --- PLANOS DE BITS ---
     print(f"\n{'─' * W}")
-    print(f"  RESULTADO DOS TESTES — PLANOS DE BITS (contexto 1D, recalc_window={rw})")
+    print(f"  PLANOS DE BITS (contexto 1D lookahead, recalc_window={rw})")
     print(f"{'─' * W}")
-    print(f"{'BLOCO':>8} | {'ARQUIVO':<12} | {'ORIGINAL':>10} | {'BLOCOS':>6} | "
-          f"{'OVERHEAD':>10} | {'PADDING':>8} | {'ESTADO':>8} | {'BITSTREAM':>10} | {'COMPRIMIDO':>11} | "
-          f"{'TAXA':>8} | {'T_ENC':>8} | {'T_DEC':>8} | {'OK'}")
+    print(header_row)
     print("-" * W)
 
     plano_dir = "Plano_de_Bits"
@@ -214,19 +228,10 @@ def main():
             print(f"  plano_bit_{p}.txt não encontrado, pulando.")
             continue
         r = run_one(path, rw)
-        ok = "✓" if r["decode_ok"] else "✗"
-        print(f"{rw:>8} | {'PLANO_'+str(p):<12} | {r['n']:>10} | {r['n_blocks']:>6} | "
-              f"{r['bits_hdr']:>10} | {r['bits_pad']:>8} | {r['bits_state']:>8} | {r['bits_bs']:>10} | {r['bits_total']:>11} | "
-              f"{r['taxa']:>7.2f}% | {r['t_enc']:>7.4f}s | {r['t_dec']:>7.4f}s | {ok}")
-        g_n += r['n']; g_bs += r['bits_bs']; g_state += r['bits_state']
-        g_hdr += r['bits_hdr']; g_pad += r['bits_pad']; g_total += r['bits_total']
-    # Resumo global
-    if g_n > 0:
-        g_taxa = (1.0 - g_total / g_n) * 100
-        print("-" * W)
-        print(f"{'':>8} | {'GLOBAL':<12} | {g_n:>10} | {'':>6} | "
-              f"{g_hdr:>10} | {g_pad:>8} | {g_state:>8} | {g_bs:>10} | {g_total:>11} | "
-              f"{g_taxa:>7.2f}% | {'':>8} | {'':>8} |")
+        print_row("PLANO_" + str(p), r)
+        g_n += r["n"]; g_bs += r["bits_bs"]; g_state += r["bits_state"]
+        g_hdr += r["bits_hdr"]; g_pad += r["bits_pad"]; g_total += r["bits_total"]
+    print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total)
 
     print(f"\n{'=' * W}")
     print("  Processamento concluído.")

@@ -1,8 +1,8 @@
 
 NUM_CONTEXTS_1D = 2   # 0 e 1 (bit anterior/próximo)
 
-PRECISION_BITS = 12           # bits de precisão (padrão FSE/zstd)
-PRECISION      = 1 << PRECISION_BITS  # 4096
+PRECISION_BITS = 5          # bits de precisão
+PRECISION      = 1 << PRECISION_BITS  # 32
 
 
 class ContextModel:
@@ -22,20 +22,7 @@ class ContextModel:
         self._freq         = [[1, 1] for _ in range(num_contexts)]
         self._block_freqs  = []
 
-    def prime_static_from_scan(self, symbols: list) -> None:
-        """
-        Pré-varredura de todos os símbolos (sequências 1D).
-        Usa lookahead context: ctx do símbolo i = symbol[i+1].
-        Define _no_recalc=True → tabela fixa para todo o stream.
-        """
-        counts = [[1, 1] for _ in range(self.num_contexts)]
-        n = len(symbols)
-        for i in range(n):
-            ctx = symbols[i + 1] if i + 1 < n else 0
-            counts[ctx][symbols[i]] += 1
-        self._freq        = self._normalize(counts)
-        self._init_header = [c[0] for c in self._freq]
-        self._no_recalc   = True
+
 
 
 

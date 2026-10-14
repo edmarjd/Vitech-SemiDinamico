@@ -6,7 +6,7 @@ O ANS é uma técnica moderna de codificação entrópica que substitui o cláss
 
 ---
 
-## 🛠 Pré-requisitos e Configuração
+## Pré-requisitos e Configuração
 
 Para executar os scripts em Python, você precisará ter o Python 3 instalado com as seguintes bibliotecas:
 
@@ -53,6 +53,7 @@ Esse script vai processar a imagem, salvar um gráfico combinando os bits (`resu
 Se você quer executar o streaming contextual em um arquivo `txt` individual.
 
 > **Atenção:** execute os comandos de dentro da pasta do projeto:
+>
 > ```bash
 > cd ~/Documentos/Vitech/Projeto-ANS-main
 > ```
@@ -68,7 +69,6 @@ python3 "ANS-Streaming Encoder.py" --input input.txt --output comprimido.bin --m
 ```bash
 python3 ANS-Streaming-Decoder.py --encoded comprimido.bin --output saida.txt --verify input.txt
 ```
-
 
 ### 3. tANS Estático (Implementação C)
 
@@ -115,3 +115,6 @@ Diferente da versão primária em C ou das primitivas anteriores, os scripts Pyt
 
 - **Estado Contínuo**: Em vez de fazer reflush de estado por blocos curtos e gastar performance gravando padding, o ANS carrega um macro-estado continuamente e despacha bits excedentes instantaneamente, gerando Overhead próximo de zero;
 - **Contexto _Lookahead_**: Foi introduzida predição contextual via cadeias de Markov onde a probabilidade de um bit é modulada com base no próximo símbolo (lookahead-1). No decoder (por ser operado em passo reverso - LIFO), o próximo símbolo já está perfeitamente acessível, tornando-o ultraeficiente e eliminando cabeçalhos de predição embutidos.
+
+cd ~/Documentos/Vitech/Projeto-ANS-main
+python3 run_all.py
