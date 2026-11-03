@@ -38,10 +38,20 @@ typedef struct {
   uint32_t state;
 } AnsState;
 
+/*
+ Para cada estado de chegada (state_idx) guardamos TODOS os estados de
+ origem possíveis. Cada candidato emitiu 'nbits' bits na codificação,
+ que são os 'nbits' bits menos significativos do estado de origem.
+ Os códigos são livres de prefixo, então basta ler bit a bit até
+ coincidir com algum candidato.
+*/
+#define MAX_CAND (2 * RANGE)
+
 typedef struct {
-  int symbol;
-  uint8_t nbits;
-  uint8_t base_state;
+  int ncand;
+  uint8_t prev[MAX_CAND];  /* índice do estado de origem (state - RANGE) */
+  uint8_t nbits[MAX_CAND]; /* bits emitidos nessa transição */
+  uint8_t sym[MAX_CAND];   /* símbolo codificado nessa transição */
 } DecodeEntry;
 
 typedef struct {
@@ -97,23 +107,22 @@ void build_rlt(int ctx_id, int cfg) {
 #endif
 
   for (int i = 0; i < RANGE; i++)
-    g_rlt[ctx_id][i].symbol = -1;
+    g_rlt[ctx_id][i].ncand = 0;
 
   for (int prev_idx = 0; prev_idx < RANGE; prev_idx++) {
-    int next_idx = at[cfg][prev_idx] - RANGE;
-    if (g_rlt[ctx_id][next_idx].symbol == -1) {
-      g_rlt[ctx_id][next_idx].symbol = 0;
-      g_rlt[ctx_id][next_idx].nbits = an[cfg][prev_idx];
-      g_rlt[ctx_id][next_idx].base_state = RANGE + prev_idx;
-    }
-  }
-  for (int prev_idx = 0; prev_idx < RANGE; prev_idx++) {
-    int next_idx = bt[cfg][prev_idx] - RANGE;
-    if (g_rlt[ctx_id][next_idx].symbol == -1) {
-      g_rlt[ctx_id][next_idx].symbol = 1;
-      g_rlt[ctx_id][next_idx].nbits = bn[cfg][prev_idx];
-      g_rlt[ctx_id][next_idx].base_state = RANGE + prev_idx;
-    }
+    /* símbolo 0 */
+    DecodeEntry *e = &g_rlt[ctx_id][at[cfg][prev_idx] - RANGE];
+    e->prev[e->ncand] = (uint8_t)prev_idx;
+    e->nbits[e->ncand] = an[cfg][prev_idx];
+    e->sym[e->ncand] = 0;
+    e->ncand++;
+
+    /* símbolo 1 */
+    e = &g_rlt[ctx_id][bt[cfg][prev_idx] - RANGE];
+    e->prev[e->ncand] = (uint8_t)prev_idx;
+    e->nbits[e->ncand] = bn[cfg][prev_idx];
+    e->sym[e->ncand] = 1;
+    e->ncand++;
   }
 }
 
@@ -157,7 +166,7 @@ uint32_t bitstream_read_bits_msb(BitstreamReader *reader, int nbits) {
 
 /*
  DECODE
- */
+*/
 
 int ans_decode_symbol_ctx(int ctx_id, AnsState *state,
                           BitstreamReader *reader) {
@@ -166,12 +175,23 @@ int ans_decode_symbol_ctx(int ctx_id, AnsState *state,
     fprintf(stderr, "Estado invalido: %u\n", state->state);
     return -1;
   }
-  DecodeEntry *entry = &g_rlt[ctx_id][idx];
+  DecodeEntry *e = &g_rlt[ctx_id][idx];
+
+  /* Lê bit a bit (MSB primeiro) até casar com os 'k' bits baixos de algum
+   * estado de origem que emitiu exatamente 'k' bits. */
   uint32_t r = 0;
-  if (entry->nbits > 0)
-    r = bitstream_read_bits_msb(reader, entry->nbits);
-  state->state = entry->base_state + r;
-  return entry->symbol;
+  for (int k = 0; k <= 8; k++) {
+    for (int c = 0; c < e->ncand; c++) {
+      uint32_t prev_state = RANGE + e->prev[c];
+      uint32_t mask = (1u << k) - 1u;
+      if (e->nbits[c] == k && (prev_state & mask) == r) {
+        state->state = prev_state;
+        return e->sym[c];
+      }
+    }
+    r = (r << 1) | bitstream_read_bits_msb(reader, 1);
+  }
+  return -1;
 }
 
 /*

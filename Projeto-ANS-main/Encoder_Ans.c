@@ -159,8 +159,8 @@ static inline void get_table_entry(int cfg, int state_idx, int symbol,
 */
 static int select_cfg(int c0, int c1) {
 #if RANGE == 10
-  int cfgs[] = {4, 5, 6, 7, 8};
-  int n = 5;
+  int cfgs[] = {0, 1};
+  int n = 2;
   const int *freqs = freq_a_range10;
 #elif RANGE == 9
   int cfgs[] = {0, 1, 2, 3, 4, 5, 6, 7};
