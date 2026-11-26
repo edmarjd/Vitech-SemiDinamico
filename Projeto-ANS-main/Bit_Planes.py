@@ -56,9 +56,11 @@ def bit_plane_slicing(image_path):
     print("Gráfico dos planos de bits salvo com sucesso como 'resultado_planos_bits.png'!")
 
 
-def testar_tans(encoder="./encoder", decoder="./decoder"):
-    """Roda o encoder/decoder em C (tabelas tANS) em cada plano_bit_N.txt,
-    confere se a decodificação é idêntica e mostra a taxa de compressão."""
+def testar_tans(encoder="./encoder", decoder="./decoder", detalhe=False, nome_img="imagem"):
+    """Roda encoder/decoder em C (tANS) em cada plano_bit_N.txt, confere a
+    decodificação e imprime um relatório em tabela (uma coluna por plano)."""
+    import time
+    import re
     for exe in (encoder, decoder):
         if not os.path.exists(exe):
             print(f"\n'{exe}' não encontrado. Compile antes:")
@@ -66,38 +68,108 @@ def testar_tans(encoder="./encoder", decoder="./decoder"):
             print("  gcc -O2 Decoder.c -o decoder")
             return
 
-    print("\n" + "=" * 60)
-    print("  TESTE tANS (tabelas em C) - encoder + decoder + verificação")
-    print("=" * 60)
+    def campo(texto, prefixo):
+        for linha in texto.splitlines():
+            if linha.startswith(prefixo):
+                return linha.split(":", 1)[1].strip()
+        return ""
 
-    total_comp, total_orig, tudo_ok = 0, 0, True
+    def inteiro(texto, prefixo):
+        m = re.match(r"-?\d+", campo(texto, prefixo))
+        return int(m.group()) if m else 0
+
+    dados, tudo_ok = [], True
     for bit in range(8):
         txt = f"plano_bit_{bit}.txt"
         enc = f"plano_bit_{bit}_encoded.bin"
         out = f"saida_{bit}.txt"
 
-        subprocess.run([encoder, txt], check=True, capture_output=True)
-        subprocess.run([decoder, enc, out], check=True, capture_output=True)
+        cmd = [encoder, txt]
+        t0 = time.perf_counter()
+        r = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        t_enc = time.perf_counter() - t0
+        if "RANGE=" not in r.stdout:
+            print(f"\nERRO no encoder (plano {bit}):\n{r.stdout}\n{r.stderr}")
+            return
+
+        t0 = time.perf_counter()
+        d = subprocess.run([decoder, enc, out], check=True, capture_output=True, text=True)
+        t_dec = time.perf_counter() - t0
+
+        if detalhe:
+            print("\n" + "#" * 70 + f"\n#  PLANO DE BIT {bit}\n" + "#" * 70)
+            print(r.stdout.strip())
+            print("\n[DECODER]\n" + d.stdout.strip())
 
         original = open(txt).read().split()
-        decodif  = open(out).read().split()
+        decodif = open(out).read().split()
         ok = (original == decodif)
         tudo_ok &= ok
 
-        comp = os.path.getsize(enc)
-        orig = len(original)            # 1 byte por pixel na imagem de 8 bits
-        total_comp += comp
-        total_orig += orig
-        taxa = 100 * (1 - comp / (orig / 8))   # taxa do plano (1 bit por simbolo)
-        print(f"  plano {bit}: {comp:8d} bytes  taxa {taxa:6.2f}%  "
-              f"{'lossless OK' if ok else 'ERRO: diverge!'}")
+        modo_raw = "RAW" in campo(r.stdout, "Modo selecionado")
+        orig = len(original)
+        comp = inteiro(r.stdout, "Comprimido (bits)")
+        dados.append({
+            "orig": orig,
+            "blocos": inteiro(r.stdout, "Blocos tANS"),
+            "overhead": inteiro(r.stdout, "Overhead (bits)"),
+            "pad": inteiro(r.stdout, "Preenchimento (bits)"),
+            "estado": inteiro(r.stdout, "Estado (bits)"),
+            "bitstream": inteiro(r.stdout, "Bitstream (bits)"),
+            "comp": comp,
+            "ganho": orig - comp,
+            "taxa": 100 * (1 - comp / orig),
+            "tabela": "RAW" if modo_raw else f"L={re.search(r'RANGE=(\d+)', r.stdout).group(1)}",
+            "bs": int(re.search(r"BLOCK_SIZE=(\d+)", r.stdout).group(1)),
+            "t_enc": t_enc * 1000, "t_dec": t_dec * 1000,
+            "ok": "OK" if ok else "ERRO",
+        })
 
-    # total_orig = soma dos simbolos dos 8 planos = 8 x pixels; imagem original = pixels bytes
-    pixels = total_orig // 8
-    print("-" * 60)
-    print(f"  TOTAL: {total_comp} bytes de {pixels} bytes (imagem 8 bits)  "
-          f"taxa {100 * (1 - total_comp / pixels):.2f}%")
-    print("  RESULTADO: " + ("TUDO LOSSLESS OK" if tudo_ok else "HÁ FALHAS"))
+    # coluna TOTAL (soma dos 8 planos)
+    tot = {k: sum(x[k] for x in dados)
+           for k in ("orig", "blocos", "overhead", "pad", "estado", "bitstream",
+                     "comp", "ganho", "t_enc", "t_dec")}
+    tot["taxa"] = 100 * (1 - tot["comp"] / tot["orig"])
+    tot["tabela"] = "-"
+    tot["ok"] = "OK" if tudo_ok else "ERRO"
+    dados.append(tot)
+
+    bs = dados[0]["bs"]
+
+    inteiro_f = lambda k: [f"{x[k]:,}".replace(",", ".") for x in dados]
+    pct_f = lambda k: [f"{x[k]:.2f}%".replace(".", ",") for x in dados]
+    ms_f = lambda k: [f"{x[k]:.1f}".replace(".", ",") for x in dados]
+    linhas = [
+        ("TAMANHO ORIGINAL (BITS)", inteiro_f("orig")),
+        ("TABELA (RANGE)", [x["tabela"] for x in dados]),
+        ("TAMANHO TOTAL DE BLOCOS", inteiro_f("blocos")),
+        ("OVERHEAD (BITS)", inteiro_f("overhead")),
+        ("BITS DE PREENCHIMENTO", inteiro_f("pad")),
+        ("ESTADO (BITS)", inteiro_f("estado")),
+        ("BITSTREAM", inteiro_f("bitstream")),
+        ("COMPRIMIDO GLOBAL", inteiro_f("comp")),
+        ("GANHO TOTAL (BITS)", inteiro_f("ganho")),
+        ("TAXA DE COMPRESSAO", pct_f("taxa")),
+        ("TEMPO ENCODER (ms)", ms_f("t_enc")),
+        ("TEMPO DECODER (ms)", ms_f("t_dec")),
+        ("VERIFICACAO LOSSLESS", [x["ok"] for x in dados]),
+    ]
+    cab = [f"PLANO {i}" for i in range(8)] + ["TOTAL"]
+    w0 = max(len(n) for n, _ in linhas) + 1
+    wc = max(11, max(len(v) for _, vs in linhas for v in vs) + 1)
+    larg = w0 + wc * len(cab)
+
+    titulo = f"PLANOS DE BITS BLOCO({bs})  -  {nome_img}"
+    print("\n" + "=" * larg)
+    print(titulo.center(larg))
+    print("=" * larg)
+    print(" " * w0 + "".join(c.rjust(wc) for c in cab))
+    print("-" * larg)
+    for nome, vals in linhas:
+        print(nome.ljust(w0) + "".join(v.rjust(wc) for v in vals))
+        if nome in ("TAMANHO ORIGINAL (BITS)", "COMPRIMIDO GLOBAL", "TAXA DE COMPRESSAO"):
+            print("-" * larg)
+    print("=" * larg)
 
 
 if __name__ == "__main__":
@@ -115,4 +187,5 @@ if __name__ == "__main__":
         target = "foto.jpg"
 
     bit_plane_slicing(target)
-    testar_tans()
+    # Opção: --detalhe mostra o log completo de cada plano
+    testar_tans(detalhe="--detalhe" in sys.argv[2:], nome_img=target)

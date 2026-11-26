@@ -1,7 +1,7 @@
 """
-run_all.py — Executa encoder/decoder em todos os inputs e planos de bits.
+run_all.py — Executa encoder/decoder rANS (semi-dinâmico) em todos os inputs e planos de bits.
 Uso:
-    python3 run_all.py --recalc-window 1000
+    python3 run_all.py --recalc-window 1000 --blocos-por-lote 4
 """
 
 import os
@@ -9,15 +9,15 @@ import time
 import argparse
 from collections import deque
 
-from context_model import ContextModel, NUM_CONTEXTS_1D
-
+from context_model import ContextModel, PRECISION, contar_lote
 
 # ---------------------------------------------------------------------------
 # rANS primitivos
 # ---------------------------------------------------------------------------
 
+
 def _C_rANS(s, state, counts):
-    M  = counts[0] + counts[1]
+    M = counts[0] + counts[1]
     cs = sum(counts[:s])
     fs = counts[s]
     return (state // fs) * M + cs + (state % fs)
@@ -32,10 +32,10 @@ def _encode_symbol(state, s, counts, bitstream):
 
 
 def _D_rANS(state, counts):
-    M    = counts[0] + counts[1]
+    M = counts[0] + counts[1]
     slot = state % M
-    s    = 1 if slot >= counts[0] else 0
-    cs   = [0, counts[0]]
+    s = 1 if slot >= counts[0] else 0
+    cs = [0, counts[0]]
     prev = (state // M) * counts[s] + slot - cs[s]
     return s, prev
 
@@ -43,6 +43,7 @@ def _D_rANS(state, counts):
 # ---------------------------------------------------------------------------
 # Leitura de símbolos
 # ---------------------------------------------------------------------------
+
 
 def load_symbols(path):
     with open(path, "r") as f:
@@ -54,100 +55,106 @@ def load_symbols(path):
 
 
 # ---------------------------------------------------------------------------
+# Lotes: um estado rANS por lote (n blocos), probabilidade reestimada entre lotes
+# ---------------------------------------------------------------------------
+
+
+def encode_lote(symbols, start, end, model):
+    """Codifica symbols[start:end] com um estado novo. Devolve (bitstream, estado_final)."""
+    bitstream = []
+    state = PRECISION
+    for i in range(start, end):
+        ctx = symbols[i + 1] if i + 1 < end else 0
+        state = _encode_symbol(state, symbols[i], model.get_counts(ctx), bitstream)
+    return "".join(map(str, bitstream)), state
+
+
+def decode_lote(bitstream_str, final_state, n_simbolos, model):
+    """Decodifica um lote do último símbolo para o primeiro (rANS é LIFO)."""
+    bits = deque(map(int, bitstream_str[::-1]))
+    decoded = [0] * n_simbolos
+    state = final_state
+    last_decoded = 0
+    for i in range(n_simbolos - 1, -1, -1):
+        counts = model.get_counts(last_decoded)
+        s, prev = _D_rANS(state, counts)
+        M = counts[0] + counts[1]
+        while prev < M and bits:
+            prev = (prev << 1) | bits.popleft()
+        state = prev
+        decoded[i] = s
+        last_decoded = s
+    return decoded
+
+
+# ---------------------------------------------------------------------------
 # Pipeline completo para um arquivo (contexto 1D lookahead)
 # ---------------------------------------------------------------------------
 
-def run_one(path, recalc_window):
+
+def run_one(path, recalc_window, blocos_por_lote):
     symbols = load_symbols(path)
     n = len(symbols)
-    n_ctx = NUM_CONTEXTS_1D
-    rw = recalc_window
-    n_blocks = (n + rw - 1) // rw
+    tam = recalc_window * max(1, blocos_por_lote)
+    n_lotes = (n + tam - 1) // tam
 
-    def get_ctx(i):
-        """Contexto 1D lookahead: ctx do símbolo i = symbols[i+1]."""
-        return symbols[i + 1] if i + 1 < n else 0
-
-    # Pré-varredura por bloco (contexto 1D)
-    model_enc = ContextModel(mode="static", num_contexts=n_ctx, recalc_window=rw)
-    block_freqs = []
-    for b in range(n_blocks):
-        counts = [[1, 1] for _ in range(n_ctx)]
-        start = b * rw
-        end   = min(start + rw, n)
-        for i in range(start, end):
-            ctx = get_ctx(i)
-            counts[ctx][symbols[i]] += 1
-        block_freqs.append(model_enc._normalize(counts))
-    model_enc.set_block_freqs(block_freqs)
+    # Probabilidade inicial do plano (cabeçalho), gravada antes de a adaptação mexer nela
+    model_enc = ContextModel()
+    model_enc.estimar_inicial(symbols)
+    hdr_hex = model_enc.serializar_inicial()
 
     # -----------------------------------------------------------------------
-    # ENCODE (ordem direta 0 → n-1)
+    # ENCODE (lote a lote; dentro do lote, ordem direta)
     # -----------------------------------------------------------------------
-    ctx0    = get_ctx(0)
-    counts0 = model_enc.get_counts(ctx0, 0)
-    state   = counts0[0] + counts0[1]
-    bitstream = []
-
+    lotes = []
+    trocas = 0
     t0 = time.time()
-    for i in range(n):
-        ctx = get_ctx(i)
-        blk = i // rw if rw > 0 else None
-        c   = model_enc.get_counts(ctx, blk)
-        state = _encode_symbol(state, symbols[i], c, bitstream)
+    for start in range(0, n, tam):
+        end = min(start + tam, n)
+        lotes.append(encode_lote(symbols, start, end, model_enc))
+        if blocos_por_lote > 0:
+            trocas += model_enc.atualizar_lote(contar_lote(symbols, start, end))
     t_enc = time.time() - t0
 
-    bitstream_str = "".join(map(str, bitstream))
-    final_state   = state
-    hdr_hex       = model_enc.serialize_static_headers()
-
     # -----------------------------------------------------------------------
-    # DECODE (ordem inversa n-1 → 0, contexto 1D: last_decoded)
+    # DECODE (lote a lote; dentro do lote, ordem inversa)
     # -----------------------------------------------------------------------
-    model_dec = ContextModel(mode="static", num_contexts=n_ctx, recalc_window=rw)
-    model_dec.load_static_headers(hdr_hex)
+    model_dec = ContextModel()
+    model_dec.carregar_inicial(hdr_hex)
 
-    bits_q       = deque(map(int, bitstream_str[::-1]))
-    decoded      = [0] * n
-    state        = final_state
-    last_decoded = 0
-
+    decoded = []
     t0 = time.time()
-    for i in range(n - 1, -1, -1):
-        ctx = last_decoded
-        blk = i // rw if rw > 0 else None
-        c   = model_dec.get_counts(ctx, blk)
-        s, prev = _D_rANS(state, c)
-        M = c[0] + c[1]
-        while prev < M and bits_q:
-            prev = (prev << 1) | bits_q.popleft()
-        state        = prev
-        decoded[i]   = s
-        last_decoded = s
+    for k, (bitstream, final_state) in enumerate(lotes):
+        n_lote = min(tam, n - k * tam)
+        simbolos = decode_lote(bitstream, final_state, n_lote, model_dec)
+        decoded.extend(simbolos)
+        if blocos_por_lote > 0:
+            model_dec.atualizar_lote(contar_lote(simbolos, 0, len(simbolos)))
     t_dec = time.time() - t0
 
-    ok = (decoded == symbols)
+    ok = decoded == symbols
 
     # Métricas
-    bits_bs    = len(bitstream_str)
-    bits_state = final_state.bit_length() if final_state > 0 else 1
-    bits_hdr   = model_enc.header_overhead_bits()
-    bits_pad   = model_enc.padding_bits()
+    bits_bs = sum(len(b) for b, _ in lotes)
+    bits_state = sum(st.bit_length() for _, st in lotes)
+    bits_hdr = model_enc.header_overhead_bits()
+    bits_pad = model_enc.padding_bits()
     bits_total = bits_bs + bits_state + bits_hdr + bits_pad
     taxa = (1.0 - bits_total / n) * 100 if n > 0 else 0.0
 
     return {
-        "n":          n,
-        "n_blocks":   n_blocks,
-        "bits_bs":    bits_bs,
+        "n": n,
+        "n_lotes": n_lotes,
+        "trocas": trocas,
+        "bits_bs": bits_bs,
         "bits_state": bits_state,
-        "bits_hdr":   bits_hdr,
-        "bits_pad":   bits_pad,
+        "bits_hdr": bits_hdr,
+        "bits_pad": bits_pad,
         "bits_total": bits_total,
-        "taxa":       taxa,
-        "decode_ok":  ok,
-        "t_enc":      t_enc,
-        "t_dec":      t_dec,
+        "taxa": taxa,
+        "decode_ok": ok,
+        "t_enc": t_enc,
+        "t_dec": t_dec,
     }
 
 
@@ -155,21 +162,31 @@ def run_one(path, recalc_window):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Executa encoder/decoder em todos os inputs e planos de bits")
-    parser.add_argument("--recalc-window", type=int, default=1000,
-                        help="Tamanho do bloco para recalibração (padrão: 1000)")
+        description="Executa encoder/decoder rANS semi-dinâmico em todos os inputs e planos de bits"
+    )
+    parser.add_argument(
+        "--recalc-window", type=int, default=1000, help="Símbolos por bloco (padrão: 1000)"
+    )
+    parser.add_argument(
+        "--blocos-por-lote",
+        type=int,
+        default=4,
+        help="Blocos por lote: a probabilidade muda a cada n blocos (0 = fixa; padrão: 4)",
+    )
     args = parser.parse_args()
     rw = args.recalc_window
+    nb = args.blocos_por_lote
 
     W = 130
     print("=" * W)
-    print(f"  RUN ALL  |  contexto=1D lookahead  |  recalc_window = {rw}")
+    print(f"  RUN ALL  |  contexto=1D lookahead  |  bloco = {rw}  |  blocos por lote = {nb}")
     print("=" * W)
 
     header_row = (
-        f"{'BLOCO':>8} | {'ARQUIVO':<12} | {'ORIGINAL':>10} | {'BLOCOS':>6} | "
+        f"{'BLOCO':>8} | {'ARQUIVO':<12} | {'ORIGINAL':>10} | {'LOTES':>6} | "
         f"{'OVERHEAD':>10} | {'PADDING':>8} | {'ESTADO':>8} | {'BITSTREAM':>10} | "
         f"{'COMPRIMIDO':>11} | {'TAXA':>8} | {'T_ENC':>8} | {'T_DEC':>8} | OK"
     )
@@ -177,7 +194,7 @@ def main():
     def print_row(label, r):
         ok = "✓" if r["decode_ok"] else "✗"
         print(
-            f"{rw:>8} | {label:<12} | {r['n']:>10} | {r['n_blocks']:>6} | "
+            f"{rw:>8} | {label:<12} | {r['n']:>10} | {r['n_lotes']:>6} | "
             f"{r['bits_hdr']:>10} | {r['bits_pad']:>8} | {r['bits_state']:>8} | "
             f"{r['bits_bs']:>10} | {r['bits_total']:>11} | "
             f"{r['taxa']:>7.2f}% | {r['t_enc']:>7.4f}s | {r['t_dec']:>7.4f}s | {ok}"
@@ -193,45 +210,32 @@ def main():
                 f"{g_total:>11} | {g_taxa:>7.2f}% | {'':>8} | {'':>8} |"
             )
 
-    # --- INPUTS ---
-    print(f"\n{'─' * W}")
-    print(f"  INPUTS (contexto 1D lookahead, recalc_window={rw})")
-    print(f"{'─' * W}")
-    print(header_row)
-    print("-" * W)
+    def rodar_grupo(titulo, pasta, prefixo, indices, rotulo):
+        print(f"\n{'─' * W}")
+        print(f"  {titulo} (contexto 1D lookahead, bloco={rw}, blocos por lote={nb})")
+        print(f"{'─' * W}")
+        print(header_row)
+        print("-" * W)
 
-    input_dir = "inputs"
-    g_n = g_bs = g_state = g_hdr = g_pad = g_total = 0
-    for i in range(1, 9):
-        path = os.path.join(input_dir, f"input_{i}.txt")
-        if not os.path.exists(path):
-            print(f"  input_{i}.txt não encontrado, pulando.")
-            continue
-        r = run_one(path, rw)
-        print_row("INPUT_" + str(i), r)
-        g_n += r["n"]; g_bs += r["bits_bs"]; g_state += r["bits_state"]
-        g_hdr += r["bits_hdr"]; g_pad += r["bits_pad"]; g_total += r["bits_total"]
-    print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total)
+        g_n = g_bs = g_state = g_hdr = g_pad = g_total = 0
+        for i in indices:
+            nome = f"{prefixo}_{i}.txt"
+            path = os.path.join(pasta, nome)
+            if not os.path.exists(path):
+                print(f"  {nome} não encontrado, pulando.")
+                continue
+            r = run_one(path, rw, nb)
+            print_row(rotulo + str(i), r)
+            g_n += r["n"]
+            g_bs += r["bits_bs"]
+            g_state += r["bits_state"]
+            g_hdr += r["bits_hdr"]
+            g_pad += r["bits_pad"]
+            g_total += r["bits_total"]
+        print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total)
 
-    # --- PLANOS DE BITS ---
-    print(f"\n{'─' * W}")
-    print(f"  PLANOS DE BITS (contexto 1D lookahead, recalc_window={rw})")
-    print(f"{'─' * W}")
-    print(header_row)
-    print("-" * W)
-
-    plano_dir = "Plano_de_Bits"
-    g_n = g_bs = g_state = g_hdr = g_pad = g_total = 0
-    for p in range(8):
-        path = os.path.join(plano_dir, f"plano_bit_{p}.txt")
-        if not os.path.exists(path):
-            print(f"  plano_bit_{p}.txt não encontrado, pulando.")
-            continue
-        r = run_one(path, rw)
-        print_row("PLANO_" + str(p), r)
-        g_n += r["n"]; g_bs += r["bits_bs"]; g_state += r["bits_state"]
-        g_hdr += r["bits_hdr"]; g_pad += r["bits_pad"]; g_total += r["bits_total"]
-    print_global(g_n, g_bs, g_state, g_hdr, g_pad, g_total)
+    rodar_grupo("INPUTS", "inputs", "input", range(1, 9), "INPUT_")
+    rodar_grupo("PLANOS DE BITS", "Plano_de_Bits", "plano_bit", range(8), "PLANO_")
 
     print(f"\n{'=' * W}")
     print("  Processamento concluído.")

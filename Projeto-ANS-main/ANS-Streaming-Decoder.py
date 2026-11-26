@@ -1,21 +1,23 @@
+
 import os
 import argparse
+import time
 from collections import deque
 
-from context_model import ContextModel, NUM_CONTEXTS_1D
-
+from context_model import ContextModel, PRECISION, contar_lote
 
 # ---------------------------------------------------------------------------
 # rANS primitivos (decoder)
 # ---------------------------------------------------------------------------
+
 
 def _D_rANS(state: int, counts: list[int]) -> tuple[int, int]:
     """
     Decodifica um símbolo do estado rANS.
     counts = [c0, c1]. Retorna (símbolo, estado_anterior_não_normalizado).
     """
-    M  = counts[0] + counts[1]
-    cs = [0, counts[0]]      # frequências acumuladas: cs[0]=0, cs[1]=c0
+    M = counts[0] + counts[1]
+    cs = [0, counts[0]]  # frequências acumuladas: cs[0]=0, cs[1]=c0
     slot = state % M
     # Encontra o símbolo cujo intervalo cobre 'slot'
     s = 1 if slot >= counts[0] else 0
@@ -23,28 +25,63 @@ def _D_rANS(state: int, counts: list[int]) -> tuple[int, int]:
     return s, prev
 
 
-def decode_stream(bitstream_str: str, final_state: int, num_symbols: int,
-                  model: ContextModel,
-                  recalc_window: int = 0) -> list[int]:
+# ---------------------------------------------------------------------------
+# Decoder contextual semi-dinâmico (um estado rANS por lote)
+#
+# Os lotes são decodificados na ordem em que aparecem no arquivo. Dentro de um
+# lote a decodificação vai do último símbolo para o primeiro (o rANS é LIFO).
+# Depois de cada lote, a mesma regra do encoder reestima as probabilidades.
+# ---------------------------------------------------------------------------
+
+
+def tamanho_lote(recalc_window: int, blocos_por_lote: int) -> int:
+    """Símbolos por lote. blocos_por_lote = 0 (probabilidade fixa) usa lotes de 1 bloco."""
+    return recalc_window * max(1, blocos_por_lote)
+
+
+def decode_lote(
+    bitstream_str: str, final_state: int, n_simbolos: int, model: ContextModel
+) -> tuple[list[int], int, int]:
+    """Decodifica um lote. Devolve (símbolos, estado_inicial_recuperado, bits_não_lidos)."""
     bits = deque(map(int, bitstream_str[::-1]))
-    decoded      = [0] * num_symbols
-    state        = final_state
-    last_decoded = 0
+    decoded = [0] * n_simbolos
+    state = final_state
+    last_decoded = 0  # contexto do último símbolo do lote
 
-    for i in range(num_symbols - 1, -1, -1):
-        ctx = last_decoded
-
-        blk    = i // recalc_window if recalc_window > 0 else None
-        counts = model.get_counts(ctx, blk)
+    for i in range(n_simbolos - 1, -1, -1):
+        counts = model.get_counts(last_decoded)
         s, prev = _D_rANS(state, counts)
         M = counts[0] + counts[1]
         while prev < M and bits:
             prev = (prev << 1) | bits.popleft()
 
-        state        = prev
-        decoded[i]   = s
+        state = prev
+        decoded[i] = s
         last_decoded = s
 
+    return decoded, state, len(bits)
+
+
+def decode_stream(
+    lotes: list[tuple[str, int]],
+    num_symbols: int,
+    model: ContextModel,
+    recalc_window: int,
+    blocos_por_lote: int,
+) -> list[int]:
+    tam = tamanho_lote(recalc_window, blocos_por_lote)
+    decoded: list[int] = []
+    for k, (bitstream, final_state) in enumerate(lotes):
+        n_lote = min(tam, num_symbols - k * tam)
+        simbolos, estado_inicial, sobrou = decode_lote(bitstream, final_state, n_lote, model)
+        if estado_inicial != PRECISION or sobrou:
+            raise ValueError(
+                f"lote {k} inconsistente (estado inicial {estado_inicial}, "
+                f"{sobrou} bits não lidos): arquivo corrompido ou parâmetros diferentes do encoder."
+            )
+        decoded.extend(simbolos)
+        if blocos_por_lote > 0:
+            model.atualizar_lote(contar_lote(simbolos, 0, len(simbolos)))
     return decoded
 
 
@@ -52,19 +89,26 @@ def decode_stream(bitstream_str: str, final_state: int, num_symbols: int,
 # Leitura do arquivo comprimido
 # ---------------------------------------------------------------------------
 
+
 def load_encoded(path: str) -> dict:
     """Lê o arquivo no formato do encoder e retorna campos como dict."""
     with open(path, "r") as f:
-        lines = f.readlines()
-    if len(lines) < 6:
-        raise ValueError(f"Arquivo '{path}' tem formato inválido (≥ 6 linhas esperadas).")
+        lines = f.read().split("\n")
+    if len(lines) < 5:
+        raise ValueError(f"Arquivo '{path}' tem formato inválido (≥ 5 linhas esperadas).")
+    lotes = []
+    for linha in lines[5:]:
+        if not linha.strip():
+            continue  # linha em branco (por exemplo, a última, depois do \n final)
+        estado, _, bitstream = linha.partition(" ")
+        lotes.append((bitstream.strip(), int(estado)))
     return {
-        "num_symbols":   int(lines[0].strip()),
-        "mode":          lines[1].strip(),
+        "num_symbols": int(lines[0].strip()),
+        "mode": lines[1].strip(),
         "recalc_window": int(lines[2].strip()),
-        "bitstream":     lines[3].strip(),
-        "final_state":   int(lines[4].strip()),
-        "headers_hex":   lines[5].strip(),
+        "blocos_por_lote": int(lines[3].strip()),
+        "headers_hex": lines[4].strip(),
+        "lotes": lotes,
     }
 
 
@@ -72,11 +116,12 @@ def load_encoded(path: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(description="ANS Streaming Decoder — Contextual")
+    parser = argparse.ArgumentParser(description="ANS Streaming Decoder — Contextual semi-dinâmico")
     parser.add_argument("--encoded", default="input_encoded.bin", help="Arquivo comprimido")
-    parser.add_argument("--output",  default="output.txt",        help="Arquivo de saída")
-    parser.add_argument("--verify",  default="",                  help="Arquivo original para verificação")
+    parser.add_argument("--output", default="output.txt", help="Arquivo de saída")
+    parser.add_argument("--verify", default="", help="Arquivo original para verificação")
     args = parser.parse_args()
 
     if not os.path.exists(args.encoded):
@@ -84,35 +129,31 @@ def main():
         return
 
     print("=" * 72)
-    print("  ANS STREAMING DECODER")
+    print("  ANS STREAMING DECODER  |  semi-dinâmico")
     print("=" * 72)
 
     data = load_encoded(args.encoded)
-    num_symbols   = data["num_symbols"]
-    mode          = data["mode"]
+    num_symbols = data["num_symbols"]
     recalc_window = data["recalc_window"]
-    bitstream     = data["bitstream"]
-    final_state   = data["final_state"]
-    headers_hex   = data["headers_hex"]
+    blocos_por_lote = data["blocos_por_lote"]
+    lotes = data["lotes"]
 
-    n_ctx = NUM_CONTEXTS_1D
+    if data["mode"] != "semidinamico":
+        print(f"Erro: modo '{data['mode']}' não suportado (esperado: semidinamico).")
+        return
 
     print(f"Símbolos a decodificar : {num_symbols}")
-    print(f"Modo                   : {mode}")
-    print(f"Contexto               : 1D (lookahead-1)")
-    print(f"Recalc window          : {recalc_window}")
-    print(f"Bits no bitstream      : {len(bitstream)}")
-    print(f"Estado final           : {final_state}")
+    print("Contexto               : 1D (lookahead-1)")
+    print(f"Bloco                  : {recalc_window} símbolos")
+    print(f"Blocos por lote        : {blocos_por_lote}")
+    print(f"Lotes                  : {len(lotes)}")
+    print(f"Bits no bitstream      : {sum(len(b) for b, _ in lotes)}")
 
-    model = ContextModel(mode=mode, num_contexts=n_ctx,
-                         recalc_window=recalc_window)
-    model.load_static_headers(headers_hex)
+    model = ContextModel()
+    model.carregar_inicial(data["headers_hex"])
 
-    import time
     t0 = time.time()
-    decoded = decode_stream(bitstream, final_state, num_symbols, model,
-                            recalc_window=recalc_window)
-
+    decoded = decode_stream(lotes, num_symbols, model, recalc_window, blocos_por_lote)
     t1 = time.time()
 
     # Salva resultado
